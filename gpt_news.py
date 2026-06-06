@@ -1,8 +1,9 @@
 """
-뉴스 수집 모듈 — RSS 기반 (API 크레딧 불필요)
+뉴스 수집 모듈
 
 국내: 매일경제 RSS
-국외: Investing.com / CNBC / Yahoo Finance RSS + 한국어 번역 요약
+국외: Investing.com / CNBC / Yahoo Finance RSS + GPT-4o-mini 한국어 번역 요약
+과거 날짜: JSON 파일 캐시 (한 번 조회한 기사를 저장해 재활용)
 """
 import json
 import re
@@ -20,19 +21,56 @@ _env_path = Path(__file__).parent / ".env"
 load_dotenv(_env_path, override=True)
 
 # ---------------------------------------------------------------------------
+# 파일 캐시 (과거 날짜 기사 저장용)
+# ---------------------------------------------------------------------------
+
+_CACHE_FILE = Path(__file__).parent / "news_cache.json"
+
+
+def _load_cache() -> dict:
+    try:
+        return json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_cache(cache: dict) -> None:
+    try:
+        # 31일 초과 데이터 정리
+        kst_today = datetime.now(timezone(timedelta(hours=9))).date()
+        pruned = {
+            k: v for k, v in cache.items()
+            if abs((kst_today - datetime.strptime(k, "%Y-%m-%d").date()).days) <= 31
+        }
+        _CACHE_FILE.write_text(json.dumps(pruned, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _cache_get(date: str, category: str) -> list[dict] | None:
+    return _load_cache().get(date, {}).get(category)
+
+
+def _cache_set(date: str, category: str, items: list[dict]) -> None:
+    cache = _load_cache()
+    cache.setdefault(date, {})[category] = items
+    _save_cache(cache)
+
+
+# ---------------------------------------------------------------------------
 # RSS 피드 설정
 # ---------------------------------------------------------------------------
 
 _DOMESTIC_FEEDS = [
-    ("매일경제", "https://www.mk.co.kr/rss/30100041/"),   # 경제
-    ("매일경제", "https://www.mk.co.kr/rss/30200030/"),   # 증권·금융
+    ("매일경제", "https://www.mk.co.kr/rss/30100041/"),
+    ("매일경제", "https://www.mk.co.kr/rss/30200030/"),
 ]
 
 _INTL_FEEDS = [
-    ("Investing.com", "https://www.investing.com/rss/news_301.rss"),   # 경제 지표
-    ("Investing.com", "https://www.investing.com/rss/news_285.rss"),   # 중앙은행
-    ("Investing.com", "https://www.investing.com/rss/news_11.rss"),    # 원자재·유가
-    ("Investing.com", "https://www.investing.com/rss/news_1.rss"),     # 전체
+    ("Investing.com", "https://www.investing.com/rss/news_301.rss"),
+    ("Investing.com", "https://www.investing.com/rss/news_285.rss"),
+    ("Investing.com", "https://www.investing.com/rss/news_11.rss"),
+    ("Investing.com", "https://www.investing.com/rss/news_1.rss"),
     ("CNBC",          "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147"),
     ("Yahoo Finance", "https://finance.yahoo.com/news/rssindex"),
     ("MarketWatch",   "https://feeds.marketwatch.com/marketwatch/topstories/"),
@@ -104,7 +142,6 @@ def _parse_date(entry) -> datetime | None:
 def _clean(text: str) -> str:
     text = re.sub(r"<[^>]+>", " ", text or "")
     text = html.unescape(text)
-    # cp1252로 잘못 해석된 UTF-8 복원 (â€™ → ' 등)
     try:
         text = text.encode("cp1252").decode("utf-8")
     except (UnicodeEncodeError, UnicodeDecodeError):
@@ -128,7 +165,6 @@ def _is_today(entry, target_date: str) -> bool:
 
 
 def _is_old_date(date_str: str) -> bool:
-    """선택 날짜가 2일 이상 지난 경우 → RSS 피드에 기사 없을 가능성 높음"""
     target = datetime.strptime(date_str, "%Y-%m-%d").date()
     today = datetime.now(timezone(timedelta(hours=9))).date()
     return (today - target).days >= 2
@@ -144,7 +180,6 @@ def _entry_to_item(entry, source_name: str) -> dict:
 
 
 def _deduplicate(items: list[dict]) -> list[dict]:
-    """URL 일치 및 제목 유사도 기반 중복 제거"""
     seen_urls: set[str] = set()
     seen_title_words: list[set] = []
     unique = []
@@ -152,7 +187,6 @@ def _deduplicate(items: list[dict]) -> list[dict]:
         url = item.get("url", "")
         if url and url in seen_urls:
             continue
-
         title_words = set(re.findall(r'\w+', item["title"].lower()))
         is_dup = False
         for sw in seen_title_words:
@@ -162,18 +196,16 @@ def _deduplicate(items: list[dict]) -> list[dict]:
             if overlap >= 0.55:
                 is_dup = True
                 break
-
         if not is_dup:
             unique.append(item)
             if url:
                 seen_urls.add(url)
             seen_title_words.append(title_words)
-
     return unique
 
 
 # ---------------------------------------------------------------------------
-# 번역 (국외 기사 → 한국어)
+# GPT-4o-mini 번역 (OpenAI API 우선, OpenRouter 폴백)
 # ---------------------------------------------------------------------------
 
 _FREE_MODELS = [
@@ -183,11 +215,27 @@ _FREE_MODELS = [
 
 
 def _call_llm(prompt: str, max_tokens: int = 3000, timeout: int = 90) -> str | None:
-    """사용 가능한 무료 모델을 순서대로 시도해 응답 텍스트를 반환."""
     import time
 
-    api_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
-    if not api_key:
+    # 1순위: OpenAI API (gpt-4o-mini)
+    openai_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if openai_key:
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=openai_key)
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                timeout=timeout,
+            )
+            return response.choices[0].message.content
+        except Exception:
+            pass
+
+    # 2순위: OpenRouter 무료 모델 (폴백)
+    openrouter_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+    if not openrouter_key:
         return None
 
     for model in _FREE_MODELS:
@@ -203,16 +251,14 @@ def _call_llm(prompt: str, max_tokens: int = 3000, timeout: int = 90) -> str | N
                     "https://openrouter.ai/api/v1/chat/completions",
                     data=payload_bytes,
                     headers={
-                        "Authorization": f"Bearer {api_key}",
+                        "Authorization": f"Bearer {openrouter_key}",
                         "Content-Type": "application/json",
                     },
                     timeout=timeout,
                 )
                 data = resp.json()
-
                 if "error" not in data:
                     return data["choices"][0]["message"]["content"]
-
                 code = data["error"].get("code", 0)
                 if code == 429 and attempt == 0:
                     wait = int(data["error"].get("metadata", {}).get("retry_after_seconds", 35))
@@ -226,7 +272,7 @@ def _call_llm(prompt: str, max_tokens: int = 3000, timeout: int = 90) -> str | N
 
 
 def _translate_batch(items: list[dict]) -> list[dict]:
-    """국외 기사를 한국어 제목 + 요약으로 일괄 번역 (OpenRouter 무료 모델)."""
+    """GPT-4o-mini로 국외 기사를 한국어 제목 + 요약으로 일괄 번역."""
     if not items:
         return items
 
@@ -251,11 +297,9 @@ def _translate_batch(items: list[dict]) -> list[dict]:
         content = _call_llm(prompt, max_tokens=3000, timeout=90)
         if not content:
             return items
-
         match = re.search(r'\[.*\]', content, re.DOTALL)
         if not match:
             return items
-
         translations = json.loads(match.group(0))
         for t in translations:
             idx = int(t.get("id", 0)) - 1
@@ -276,13 +320,28 @@ def _translate_batch(items: list[dict]) -> list[dict]:
 def get_news(date: str, category: str) -> list[dict]:
     """
     category: "domestic" | "international"
-    반환: [{"title", "summary", "source", "url"}, ...]
+    반환: [{"title", "summary", "source", "url", "_fallback"(선택)}, ...]
+
+    캐시 우선 조회 → 없으면 RSS 수집 후 캐시 저장.
+    과거 날짜 + RSS 결과 없으면 최신 기사로 폴백(_fallback=True 표시).
     """
+    # 캐시 확인 (과거 날짜에 이미 조회한 기사가 있으면 즉시 반환)
+    cached = _cache_get(date, category)
+    if cached is not None:
+        return cached
+
     if category == "domestic":
-        return _get_domestic(date)
+        result = _get_domestic(date)
     elif category == "international":
-        return _get_international(date)
-    return []
+        result = _get_international(date)
+    else:
+        return []
+
+    # 폴백이 아닌 실제 해당 날짜 기사만 캐시에 저장
+    if result and not result[0].get("_fallback"):
+        _cache_set(date, category, result)
+
+    return result
 
 
 def _get_domestic(date: str) -> list[dict]:
