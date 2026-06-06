@@ -62,18 +62,28 @@ st.subheader(f"📌 {selected_date.year}년 {selected_date.month}월 {selected_d
 
 tab_domestic, tab_intl = st.tabs(["🇰🇷 국내 경제", "🌐 국외 경제"])
 
+def _show_fallback_warning():
+    st.warning("RSS 피드는 최신 기사만 보관합니다. 선택한 날짜의 기사가 없어 **현재 최신 뉴스**를 표시합니다.")
+
+
 with tab_domestic:
     cache_key = f"{date_str}_domestic"
     if cache_key not in st.session_state:
         with st.spinner("국내 뉴스를 수집하는 중..."):
             st.session_state[cache_key] = get_news(date_str, "domestic")
-    render_news_list(st.session_state[cache_key])
+    news_dom = st.session_state[cache_key]
+    if news_dom and news_dom[0].get("_fallback"):
+        _show_fallback_warning()
+    render_news_list(news_dom)
 
 with tab_intl:
     cache_key_intl = f"{date_str}_international"
     if cache_key_intl not in st.session_state:
         with st.spinner("국외 뉴스 수집 및 번역 중... (30~60초 소요)"):
             st.session_state[cache_key_intl] = get_news(date_str, "international")
-    render_news_list(st.session_state[cache_key_intl])
+    news_intl = st.session_state[cache_key_intl]
+    if news_intl and news_intl[0].get("_fallback"):
+        _show_fallback_warning()
+    render_news_list(news_intl)
 
 st.caption(f"마지막 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

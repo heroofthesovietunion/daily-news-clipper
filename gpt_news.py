@@ -127,6 +127,13 @@ def _is_today(entry, target_date: str) -> bool:
     return abs((local_date - target).days) <= 1
 
 
+def _is_old_date(date_str: str) -> bool:
+    """선택 날짜가 2일 이상 지난 경우 → RSS 피드에 기사 없을 가능성 높음"""
+    target = datetime.strptime(date_str, "%Y-%m-%d").date()
+    today = datetime.now(timezone(timedelta(hours=9))).date()
+    return (today - target).days >= 2
+
+
 def _entry_to_item(entry, source_name: str) -> dict:
     return {
         "title": _clean(entry.get("title", "제목 없음")),
@@ -279,36 +286,47 @@ def get_news(date: str, category: str) -> list[dict]:
 
 
 def _get_domestic(date: str) -> list[dict]:
-    items = []
-    for source_name, url in _DOMESTIC_FEEDS:
-        for entry in _fetch_feed(url):
-            if not _is_today(entry, date):
-                continue
-            title = _clean(entry.get("title", ""))
-            if not title:
-                continue
-            if not _contains_kw(title, _DOMESTIC_ECON_KW):
-                continue
-            items.append(_entry_to_item(entry, source_name))
+    def _fetch(date_filter: bool) -> list[dict]:
+        items = []
+        for source_name, url in _DOMESTIC_FEEDS:
+            for entry in _fetch_feed(url):
+                if date_filter and not _is_today(entry, date):
+                    continue
+                title = _clean(entry.get("title", ""))
+                if not title or not _contains_kw(title, _DOMESTIC_ECON_KW):
+                    continue
+                items.append(_entry_to_item(entry, source_name))
+        return _deduplicate(items)[:15]
 
-    return _deduplicate(items)[:15]
+    result = _fetch(date_filter=True)
+    if not result and _is_old_date(date):
+        result = _fetch(date_filter=False)
+        for item in result:
+            item["_fallback"] = True
+    return result
 
 
 def _get_international(date: str) -> list[dict]:
-    items = []
-    for source_name, url in _INTL_FEEDS:
-        for entry in _fetch_feed(url):
-            if not _is_today(entry, date):
-                continue
-            title = _clean(entry.get("title", ""))
-            if not title:
-                continue
-            full_text = (title + " " + _clean(entry.get("summary", ""))).lower()
-            if _contains_kw(full_text, _EXCLUDE_KW):
-                continue
-            if not _contains_kw(full_text, _INTL_ECON_KW):
-                continue
-            items.append(_entry_to_item(entry, source_name))
+    def _fetch(date_filter: bool) -> list[dict]:
+        items = []
+        for source_name, url in _INTL_FEEDS:
+            for entry in _fetch_feed(url):
+                if date_filter and not _is_today(entry, date):
+                    continue
+                title = _clean(entry.get("title", ""))
+                if not title:
+                    continue
+                full_text = (title + " " + _clean(entry.get("summary", ""))).lower()
+                if _contains_kw(full_text, _EXCLUDE_KW):
+                    continue
+                if not _contains_kw(full_text, _INTL_ECON_KW):
+                    continue
+                items.append(_entry_to_item(entry, source_name))
+        return _deduplicate(items)[:12]
 
-    unique = _deduplicate(items)[:12]
+    unique = _fetch(date_filter=True)
+    if not unique and _is_old_date(date):
+        unique = _fetch(date_filter=False)
+        for item in unique:
+            item["_fallback"] = True
     return _translate_batch(unique)
